@@ -62,6 +62,7 @@ import org.apache.dubbo.metadata.MetadataServiceExporter;
 import org.apache.dubbo.metadata.WritableMetadataService;
 import org.apache.dubbo.metadata.report.MetadataReportFactory;
 import org.apache.dubbo.metadata.report.MetadataReportInstance;
+import org.apache.dubbo.metadata.report.support.AbstractMetadataReportFactory;
 import org.apache.dubbo.registry.client.DefaultServiceInstance;
 import org.apache.dubbo.registry.client.ServiceInstance;
 import org.apache.dubbo.registry.client.ServiceInstanceCustomizer;
@@ -77,9 +78,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -176,7 +179,7 @@ public class DubboBootstrap {
 
     private volatile MetadataServiceExporter metadataServiceExporter;
 
-    private List<ServiceConfigBase<?>> exportedServices = new ArrayList<>();
+    private Map<String, ServiceConfigBase<?>> exportedServices = new ConcurrentHashMap<>();
 
     private List<Future<?>> asyncExportingFutures = new ArrayList<>();
 
@@ -639,7 +642,7 @@ public class DubboBootstrap {
         for (MetadataReportConfig metadataReportConfig : metadataReportConfigs) {
             ConfigValidationUtils.validateMetadataConfig(metadataReportConfig);
             if (!metadataReportConfig.isValid()) {
-                return;
+                continue;
             }
             MetadataReportInstance.init(metadataReportConfig);
         }
@@ -677,6 +680,10 @@ public class DubboBootstrap {
         String protocol = registryConfig.getProtocol();
         Integer port = registryConfig.getPort();
         String id = "config-center-" + protocol + "-" + port;
+        if (configManager.getConfigCenter(id) != null) {
+            return null;
+        }
+
         ConfigCenterConfig cc = new ConfigCenterConfig();
         cc.setId(id);
         if (cc.getParameters() == null) {
@@ -778,6 +785,10 @@ public class DubboBootstrap {
         String protocol = registryConfig.getProtocol();
         Integer port = registryConfig.getPort();
         String id = "metadata-center-" + protocol + "-" + port;
+        if (configManager.getMetadataConfig(id) != null) {
+            return null;
+        }
+
         MetadataReportConfig metadataReportConfig = new MetadataReportConfig();
         metadataReportConfig.setId(id);
         if (metadataReportConfig.getParameters() == null) {
@@ -865,6 +876,7 @@ public class DubboBootstrap {
      */
     public DubboBootstrap start() {
         if (started.compareAndSet(false, true)) {
+            destroyed.set(false);
             ready.set(false);
             initialize();
             if (logger.isInfoEnabled()) {
@@ -1022,8 +1034,17 @@ public class DubboBootstrap {
             }
             try {
                 environment.setConfigCenterFirst(configCenter.isHighestPriority());
-                environment.updateExternalConfigurationMap(parseProperties(configContent));
-                environment.updateAppExternalConfigurationMap(parseProperties(appConfigContent));
+                Map<String, String> globalRemoteProperties = parseProperties(configContent);
+                if (CollectionUtils.isEmptyMap(globalRemoteProperties)) {
+                    logger.info("No global configuration in config center");
+                }
+                environment.updateExternalConfigurationMap(globalRemoteProperties);
+
+                Map<String, String> appRemoteProperties = parseProperties(appConfigContent);
+                if (CollectionUtils.isEmptyMap(appRemoteProperties)) {
+                    logger.info("No application level configuration in config center");
+                }
+                environment.updateAppExternalConfigurationMap(appRemoteProperties);
             } catch (IOException e) {
                 throw new IllegalStateException("Failed to parse configurations from Config Center.", e);
             }
@@ -1054,23 +1075,33 @@ public class DubboBootstrap {
             if (exportAsync) {
                 ExecutorService executor = executorRepository.getServiceExporterExecutor();
                 Future<?> future = executor.submit(() -> {
-                	try {
-                        sc.export();
-                        exportedServices.add(sc);
-                	}catch (Throwable t) {
-                		logger.error("export async catch error : " + t.getMessage(), t);
-					}
+                    try {
+                        exportService(serviceConfig);
+                    } catch (Throwable t) {
+                        logger.error("export async catch error : " + t.getMessage(), t);
+                    }
                 });
                 asyncExportingFutures.add(future);
             } else {
-                sc.export();
-                exportedServices.add(sc);
+                exportService(serviceConfig);
             }
         });
     }
 
+    private void exportService(ServiceConfig sc) {
+        if (exportedServices.containsKey(sc.getServiceName())) {
+            throw new IllegalStateException("There are multiple ServiceBean instances with the same service name: [" +
+                    sc.getServiceName() + "], instances: [" +
+                    exportedServices.get(sc.getServiceName()).toString() + ", " +
+                    sc.toString() + "]. Only one service can be exported for the same triple (group, interface, version), " +
+                    "please modify the group or version if you really need to export multiple services of the same interface.");
+        }
+        sc.export();
+        exportedServices.put(sc.getServiceName(), sc);
+    }
+
     private void unexportServices() {
-        exportedServices.forEach(sc -> {
+        exportedServices.forEach((serviceName, sc) -> {
             configManager.removeConfig(sc);
             sc.unexport();
         });
@@ -1165,7 +1196,7 @@ public class DubboBootstrap {
         {
             calInstanceRevision(serviceDiscovery, serviceInstance);
             if (logger.isDebugEnabled()) {
-                logger.info("Start registering instance address to registry" + serviceDiscovery.getUrl() + ", instance " + serviceInstance);
+                logger.debug("Start registering instance address to registry" + serviceDiscovery.getUrl() + ", instance " + serviceInstance);
             }
             // register metadata
             serviceDiscovery.register(serviceInstance);
@@ -1187,9 +1218,6 @@ public class DubboBootstrap {
 
         for (String urlValue : urlValues) {
             URL url = URL.valueOf(urlValue);
-            if (MetadataService.class.getName().equals(url.getServiceInterface())) {
-                continue;
-            }
             if ("rest".equals(url.getProtocol())) { // REST first
                 selectedURL = url;
                 break;
@@ -1231,18 +1259,15 @@ public class DubboBootstrap {
     public void destroy() {
         if (destroyLock.tryLock()) {
             try {
-                DubboShutdownHook.destroyAll();
-
-                if (started.compareAndSet(true, false)
-                        && destroyed.compareAndSet(false, true)) {
-
-                    unregisterServiceInstance();
-                    unexportMetadataService();
-                    unexportServices();
-                    unreferServices();
+                if (destroyed.compareAndSet(false, true)) {
+                    if (started.compareAndSet(true, false)) {
+                        unregisterServiceInstance();
+                        unexportMetadataService();
+                        unexportServices();
+                        unreferServices();
+                    }
 
                     destroyRegistries();
-
                     destroyServiceDiscoveries();
                     destroyExecutorRepository();
                     clear();
@@ -1251,7 +1276,10 @@ public class DubboBootstrap {
                     ExtensionLoader<DubboBootstrapStartStopListener> exts = getExtensionLoader(DubboBootstrapStartStopListener.class);
                     exts.getSupportedExtensionInstances().forEach(ext -> ext.onStop(this));
                 }
+
+                DubboShutdownHook.destroyAll();
             } finally {
+                initialized.set(false);
                 destroyLock.unlock();
             }
         }
@@ -1383,5 +1411,40 @@ public class DubboBootstrap {
 
     public void setReady(boolean ready) {
         this.ready.set(ready);
+    }
+
+
+    /**
+     * Try reset dubbo status for new instance.
+     * @deprecated  For testing purposes only
+     */
+    @Deprecated
+    public static void reset() {
+        reset(true);
+    }
+
+    /**
+     * Try reset dubbo status for new instance.
+     * @deprecated For testing purposes only
+     */
+    @Deprecated
+    public static void reset(boolean destroy) {
+        DubboShutdownHook.reset();
+        if (destroy) {
+            if (instance != null) {
+                instance.destroy();
+                instance = null;
+            }
+            ApplicationModel.reset();
+            AbstractRegistryFactory.reset();
+            MetadataReportInstance.destroy();
+            AbstractMetadataReportFactory.clear();
+            ExtensionLoader.resetExtensionLoader(DynamicConfigurationFactory.class);
+            ExtensionLoader.resetExtensionLoader(MetadataReportFactory.class);
+            ExtensionLoader.destroyAll();
+        } else {
+            instance = null;
+            ApplicationModel.reset();
+        }
     }
 }
